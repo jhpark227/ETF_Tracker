@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# macOS
+.DS_Store
+
+# Tokens / secrets
+.kis_token.json
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# IDE
+.idea/
+.vscode/
+
+# pytest
+.pytest_cache/
+
+# uv
+# uv.lock is committed for reproducibility

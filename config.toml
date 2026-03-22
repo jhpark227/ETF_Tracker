@@ -1,0 +1,51 @@
+[database]
+path = "data/etf_analyzer.duckdb"
+
+[collector]
+request_delay_min = 2.0
+request_delay_max = 4.0
+backfill_batch_size = 5
+backfill_batch_delay = 10.0
+
+[analyzer]
+default_window = 5
+flow_weight = 0.4
+conviction_weight = 0.6
+active_etf_multiplier = 2.0
+
+[etf_universe]
+# Tier 1: 광역 시장 / Tier 2: 업종/테마 / Tier 3: 전략/스타일 / Tier 4: 액티브
+etfs = [
+    # --- Tier 1: 광역 시장 ---
+    { code = "069500", name = "KODEX 200", type = "passive", tier = "market", sector = "코스피200" },
+    { code = "229200", name = "KODEX 코스닥150", type = "passive", tier = "market", sector = "코스닥150" },
+    { code = "310970", name = "TIGER MSCI Korea TR", type = "passive", tier = "market", sector = "MSCI Korea" },
+    { code = "292150", name = "TIGER 코리아TOP10", type = "passive", tier = "market", sector = "대형주" },
+    { code = "495050", name = "RISE 코리아밸류업", type = "passive", tier = "market", sector = "밸류업" },
+
+    # --- Tier 2: 업종/테마 ---
+    { code = "396500", name = "TIGER 반도체TOP10", type = "passive", tier = "sector", sector = "반도체" },
+    { code = "395160", name = "KODEX AI반도체", type = "passive", tier = "sector", sector = "AI반도체" },
+    { code = "305720", name = "KODEX 2차전지산업", type = "passive", tier = "sector", sector = "2차전지" },
+    { code = "449450", name = "PLUS K방산", type = "passive", tier = "sector", sector = "방산" },
+    { code = "466920", name = "SOL 조선TOP3플러스", type = "passive", tier = "sector", sector = "조선" },
+    { code = "487240", name = "KODEX AI전력핵심설비", type = "passive", tier = "sector", sector = "AI전력" },
+    { code = "434730", name = "HANARO 원자력iSelect", type = "passive", tier = "sector", sector = "원자력" },
+    { code = "102970", name = "KODEX 증권", type = "passive", tier = "sector", sector = "금융" },
+    { code = "091180", name = "KODEX 자동차", type = "passive", tier = "sector", sector = "자동차" },
+    { code = "228790", name = "TIGER 화장품", type = "passive", tier = "sector", sector = "소비재" },
+
+    # --- Tier 3: 전략/스타일 ---
+    { code = "161510", name = "PLUS 고배당주", type = "passive", tier = "strategy", sector = "배당" },
+    { code = "102780", name = "KODEX 삼성그룹", type = "passive", tier = "strategy", sector = "삼성그룹" },
+    { code = "138540", name = "TIGER 현대차그룹플러스", type = "passive", tier = "strategy", sector = "현대차그룹" },
+    { code = "466940", name = "TIGER 은행고배당플러스TOP10", type = "passive", tier = "strategy", sector = "은행배당" },
+
+    # --- Tier 4: 액티브 ---
+    { code = "0163Y0", name = "KoAct 코스닥액티브", type = "active", tier = "active", sector = "코스닥" },
+    { code = "445290", name = "KODEX 로봇액티브", type = "active", tier = "active", sector = "로봇" },
+    { code = "444200", name = "SOL 코리아메가테크액티브", type = "active", tier = "active", sector = "메가테크" },
+    { code = "441800", name = "TIME Korea플러스배당액티브", type = "active", tier = "active", sector = "배당성장" },
+    { code = "462900", name = "KoAct 바이오헬스케어액티브", type = "active", tier = "active", sector = "바이오" },
+    { code = "494890", name = "KODEX 200액티브", type = "active", tier = "active", sector = "시장대표" },
+]

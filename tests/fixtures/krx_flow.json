@@ -1,0 +1,46 @@
+{
+  "output": [
+    {
+      "TRD_DD": "2026/03/17",
+      "TDD_CLSPRC": "35,000",
+      "FLUC_TP_CD": "1",
+      "CMPPREVDD_PRC": "200",
+      "FLUC_RT": "0.57",
+      "LST_NAV": "35,000.00",
+      "TDD_OPNPRC": "34,900",
+      "TDD_HGPRC": "35,100",
+      "TDD_LWPRC": "34,800",
+      "ACC_TRDVOL": "100,000",
+      "ACC_TRDVAL": "3,500,000,000",
+      "MKTCAP": "693,000,000,000",
+      "INVSTASST_NETASST_TOTAMT": "0",
+      "LIST_SHRS": "19,800,000",
+      "IDX_IND_NM": "코스피 200",
+      "OBJ_STKPRC_IDX": "410.50",
+      "FLUC_TP_CD1": "1",
+      "CMPPREVDD_IDX": "2.30",
+      "IDX_FLUC_RT": "0.56"
+    },
+    {
+      "TRD_DD": "2026/03/18",
+      "TDD_CLSPRC": "35,200",
+      "FLUC_TP_CD": "1",
+      "CMPPREVDD_PRC": "200",
+      "FLUC_RT": "0.57",
+      "LST_NAV": "35,200.00",
+      "TDD_OPNPRC": "35,000",
+      "TDD_HGPRC": "35,300",
+      "TDD_LWPRC": "34,900",
+      "ACC_TRDVOL": "120,000",
+      "ACC_TRDVAL": "4,200,000,000",
+      "MKTCAP": "698,720,000,000",
+      "INVSTASST_NETASST_TOTAMT": "0",
+      "LIST_SHRS": "19,850,000",
+      "IDX_IND_NM": "코스피 200",
+      "OBJ_STKPRC_IDX": "412.80",
+      "FLUC_TP_CD1": "1",
+      "CMPPREVDD_IDX": "2.30",
+      "IDX_FLUC_RT": "0.56"
+    }
+  ]
+}
