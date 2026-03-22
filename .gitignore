@@ -17,8 +17,7 @@ build/
 # Tokens / secrets
 .kis_token.json
 
-# DuckDB
-*.duckdb
+# DuckDB WAL (임시 파일만 제외, .duckdb는 포함)
 *.duckdb.wal
 
 # IDE
