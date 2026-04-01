@@ -20,6 +20,9 @@ build/
 # DuckDB WAL (임시 파일만 제외, .duckdb는 포함)
 *.duckdb.wal
 
+# Logs
+data/*.log
+
 # IDE
 .idea/
 .vscode/

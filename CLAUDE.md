@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-ETF Analyzer — Korean ETF 자금 흐름을 추적·분석하는 Python 3.14 CLI 도구. 패키지 관리는 `uv`, DB는 DuckDB 사용.
+ETF Analyzer — Korean ETF 자금 흐름을 추적·분석하는 Python 3.14 CLI + 텔레그램 브리핑 도구. 패키지 관리는 `uv`, DB는 DuckDB 사용.
 
 ## Setup
 
@@ -54,12 +54,31 @@ uv run etf-analyzer etf <ETF코드>
 uv run etf-analyzer etf 441800
 ```
 
+## Telegram Briefing
+
+매일 오전 09:30 (월~금) macOS launchd로 자동 실행.
+
+```bash
+# 수동 실행
+bash scripts/daily_collect.sh
+
+# launchd 관리
+launchctl load ~/Library/LaunchAgents/com.etf-analyzer.daily-collect.plist
+launchctl start com.etf-analyzer.daily-collect
+```
+
+핵심 함수: `etf_analyzer/notifier.py` → `build_cross_window_report()`
+- 멀티윈도우(3d/5d/10d) 교차 분석 → 5단 투자 브리핑 생성
+- 섹터 그룹핑 적용 (배당/은행배당/배당성장 → 배당)
+- 환경변수: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (.env)
+
 ## Architecture
 
 ```
 etf_analyzer/
-├── cli.py              — Typer CLI (6 commands: seed, init, collect, status, rank, detail, etf)
+├── cli.py              — Typer CLI (seed, init, collect, status, rank, detail, etf)
 ├── config.py           — AppConfig dataclass, config.toml 로더
+├── notifier.py         — 텔레그램 알림 (교차 분석 5단 브리핑, 섹터 그룹핑)
 ├── collector/
 │   ├── krx.py          — KRX HTTP 클라이언트 (fetch_isin_map, fetch_holdings, fetch_flow)
 │   └── models.py       — Pydantic 모델 + KRX 응답 파서
@@ -72,7 +91,17 @@ etf_analyzer/
     ├── conviction.py   — Conviction score (breadth × depth, 액티브 ETF 가중)
     └── ranking.py      — 퍼센타일 정규화 복합 랭킹 + 드릴다운
 config.toml             — ETF 유니버스 25종, DB 경로, 파라미터
+scripts/
+├── daily_collect.sh    — launchd 자동 수집 + 텔레그램 전송 스크립트
+└── fix_sitecustomize.py — macOS uv 버그 워크어라운드
 ```
+
+## Multi-Window Cross Analysis
+
+교차 점수 = Σ(윈도우별 combined_score × 가중치)
+- 3일: 0.20 | 5일: 0.35 | 10일: 0.45
+- 전 구간 유입 보너스 ×1.15, 패시브+액티브 동시 편입 ×1.10
+- 추세 신호: ▲ 강화 (가속), ▲ 유입 (안정), ▼ 약화 (감속), ─ (혼조)
 
 ## KRX API 현황
 
