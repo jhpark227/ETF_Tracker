@@ -7,19 +7,28 @@ import httpx
 
 
 def send_telegram(message: str, parse_mode: str = "HTML") -> bool:
-    """Send a message via Telegram Bot API. Returns True on success."""
+    """Send a message via Telegram Bot API to all configured chat IDs. Returns True if all succeed."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
+    if not token:
+        return False
+
+    chat_ids = [
+        cid for key in ("TELEGRAM_CHAT_ID", "TELEGRAM_CHAT_ID_2")
+        if (cid := os.environ.get(key, ""))
+    ]
+    if not chat_ids:
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = httpx.post(url, json={
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": parse_mode,
-    }, timeout=10)
-    return resp.status_code == 200
+    results = []
+    for chat_id in chat_ids:
+        resp = httpx.post(url, json={
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+        }, timeout=10)
+        results.append(resp.status_code == 200)
+    return all(results)
 
 
 def format_rank_text(
@@ -79,6 +88,11 @@ def build_cross_window_report(
     - 각 윈도우별 combined_score 퍼센타일 합산 (장기 가중)
     - 전 구간 유입 종목에 보너스 ×1.15
     - 패시브+액티브 동시 편입 종목에 보너스 ×1.10
+
+    포맷 (3섹션):
+    - ① 시장 국면: 국면 한 줄 + 섹터별 자금 흐름 바
+    - ② Top 10: 종목별 매수 성격 태그 + 핵심 근거 한 줄
+    - ③ 주목 시그널 + 액션 포인트
     """
     from datetime import timedelta
     from etf_analyzer.analyzer.ranking import calculate_combined_ranking
@@ -109,17 +123,20 @@ def build_cross_window_report(
         return SECTOR_GROUPS.get(sector, sector)
 
     # ETF 분류
+    # 494890 (KODEX 200액티브)은 코스피200 추종으로 사실상 패시브 — 매수 신호 판단에서 제외
+    PASSIVE_LIKE_ACTIVE = {"494890"}
     active_etf_codes = {e.code for e in config.etf_universe if e.type == "active"}
+    signal_active_etf_codes = active_etf_codes - PASSIVE_LIKE_ACTIVE
     passive_etf_codes = {e.code for e in config.etf_universe if e.type == "passive"}
     etf_sector_map = {e.code: _group_sector(e.sector) for e in config.etf_universe}
     etf_tier_map = {e.code: e.tier for e in config.etf_universe}
-    etf_name_map = {e.code: e.name for e in config.etf_universe}
+
 
     base_date = conn.execute("SELECT MAX(date) FROM etf_holdings").fetchone()[0]
     if base_date is None:
         return "데이터 없음"
 
-    # 현재 보유 ETF 맵
+    # 현재 보유 ETF 맵 (etf_code → weight)
     etf_holdings_map: dict[str, list[tuple[str, float]]] = {}
     rows = conn.execute(
         "SELECT stock_code, etf_code, weight FROM etf_holdings WHERE date = ?",
@@ -130,6 +147,7 @@ def build_cross_window_report(
 
     # 가장 긴 윈도우 기준 신규 편입 조회
     longest_w = max(windows)
+    short_w = min(windows)
     start_date = base_date - timedelta(days=longest_w)
     prev_date_row = conn.execute(
         "SELECT MAX(date) FROM etf_holdings WHERE date <= ?", [start_date]
@@ -144,13 +162,39 @@ def build_cross_window_report(
     for stock_code, etf_code in prev_rows:
         prev_holdings_map.setdefault(stock_code, set()).add(etf_code)
 
-    # ETF별 순자금유입 (인사이트용)
+    # 비중 변화 맵: stock_code → {etf_code: weight_change}
+    weight_change_map: dict[str, dict[str, float]] = {}
+    wc_rows = conn.execute("""
+        WITH cur AS (
+            SELECT stock_code, etf_code, weight FROM etf_holdings WHERE date = ?
+        ),
+        prv AS (
+            SELECT stock_code, etf_code, weight FROM etf_holdings WHERE date = ?
+        )
+        SELECT c.stock_code, c.etf_code,
+               c.weight - COALESCE(p.weight, 0) AS weight_change
+        FROM cur c LEFT JOIN prv p
+          ON c.stock_code = p.stock_code AND c.etf_code = p.etf_code
+    """, [base_date, prev_date]).fetchall()
+    for stock_code, etf_code, wc in wc_rows:
+        weight_change_map.setdefault(stock_code, {})[etf_code] = wc
+
+    # ETF별 순자금유입 (longest_w 기준)
     etf_flows_rows = conn.execute("""
         SELECT etf_code, SUM(net_units * nav) AS net_amount
         FROM etf_flow WHERE date > ? AND date <= ?
         GROUP BY etf_code
     """, [start_date, base_date]).fetchall()
     etf_flow_map = {code: net for code, net in etf_flows_rows}
+
+    # 단기(short_w) ETF별 순자금유입
+    short_start = base_date - timedelta(days=short_w)
+    short_flows_rows = conn.execute("""
+        SELECT etf_code, SUM(net_units * nav) AS net_amount
+        FROM etf_flow WHERE date > ? AND date <= ?
+        GROUP BY etf_code
+    """, [short_start, base_date]).fetchall()
+    short_etf_flow_map = {code: net for code, net in short_flows_rows}
 
     # 교차 점수 계산
     scored = []
@@ -159,6 +203,9 @@ def build_cross_window_report(
         window_flows = {}
         stock_name = ""
         breadth_val = 0.0
+        depth_val = 0.0
+        flow_pct_val = 0.0
+        conv_pct_val = 0.0
         for w in windows:
             entry = rankings_by_window[w].get(code)
             if entry:
@@ -168,6 +215,9 @@ def build_cross_window_report(
                     stock_name = entry["stock_name"]
                 if w == longest_w:
                     breadth_val = entry.get("breadth", 0.0)
+                    depth_val = entry.get("depth", 0.0)
+                    flow_pct_val = entry.get("flow_percentile", 0.0)
+                    conv_pct_val = entry.get("conviction_percentile", 0.0)
             else:
                 window_scores[w] = 0.0
                 window_flows[w] = 0.0
@@ -191,7 +241,7 @@ def build_cross_window_report(
         if both_types:
             cross_score *= 1.10
 
-        # 추세 판단 (단기→장기)
+        # 추세 판단 (단기→장기 점수 상승)
         scores_list = [window_scores.get(w, 0) for w in sorted(windows)]
         if len(scores_list) >= 2:
             trend_up = all(
@@ -205,23 +255,37 @@ def build_cross_window_report(
         else:
             trend_up = trend_down = False
 
-        # 패시브/액티브 ETF 수 + 신규 편입
+        # 유입 가속도: 단기 flow / 장기 flow (기간 정규화)
+        long_flow = window_flows.get(longest_w, 0)
+        short_flow = window_flows.get(short_w, 0)
+        if long_flow != 0:
+            acceleration = (short_flow / short_w) / (long_flow / longest_w)
+        else:
+            acceleration = 1.0
+
+        # 비중 변화 합산 (액티브 ETF 비중 변화를 별도 집계)
+        wc_by_etf = weight_change_map.get(code, {})
+        active_wc_sum = sum(
+            wc for ec, wc in wc_by_etf.items()
+            if ec in active_etf_codes and wc > 0
+        )
+        passive_wc_sum = sum(
+            wc for ec, wc in wc_by_etf.items()
+            if ec in passive_etf_codes and wc > 0
+        )
+        total_wc_sum = sum(wc for wc in wc_by_etf.values() if wc > 0)
+
+        # 신규 편입 ETF 분류
         prev_etfs = prev_holdings_map.get(code, set())
         passive_count = sum(1 for ec, _ in holdings if ec in passive_etf_codes)
         active_count = sum(1 for ec, _ in holdings if ec in active_etf_codes)
-        new_passive = sum(
-            1 for ec, _ in holdings
+        new_passive_etfs = [
+            ec for ec, _ in holdings
             if ec in passive_etf_codes and ec not in prev_etfs
-        )
-        new_active = sum(
-            1 for ec, _ in holdings
-            if ec in active_etf_codes and ec not in prev_etfs
-        )
-
-        # 편입 ETF 이름 (상위 비중 3개)
-        top_etfs = sorted(holdings, key=lambda x: x[1], reverse=True)[:3]
-        top_etf_names = [
-            etf_name_map.get(ec, ec) for ec, _ in top_etfs
+        ]
+        new_active_etfs = [
+            ec for ec, _ in holdings
+            if ec in signal_active_etf_codes and ec not in prev_etfs
         ]
 
         # 업종 태그 (해당 종목이 속한 섹터 ETF 기준)
@@ -230,6 +294,24 @@ def build_cross_window_report(
             if etf_tier_map.get(ec) == "sector":
                 stock_sectors.add(etf_sector_map.get(ec, ""))
         stock_sectors.discard("")
+
+        # ── 매수 성격 태그 결정 ──
+        # 🎯 액티브 매수: 펀드매니저 의도적 편입 (신규 or 비중 확대)
+        # 💰 자금 유입: 전구간 꾸준한 유입 (패시브+액티브 혼재)
+        # 🔄 수급 유입: 자금은 들어오나 패시브 리밸런싱 추정 (지속성 불확실)
+        # 🔻 약화: 모멘텀 소멸 or 유출
+        pct_gap = flow_pct_val - conv_pct_val  # 양수면 자금 > 확신
+
+        if new_active_etfs or (conv_pct_val >= 70 and active_wc_sum > 0):
+            buy_tag = "◆ 액티브 매수"
+        elif all_inflow and (flow_pct_val >= 60 or conv_pct_val >= 60):
+            buy_tag = "▲ 자금 유입"
+        elif pct_gap > 30 and flow_pct_val >= 60:
+            buy_tag = "△ 수급 유입"
+        elif trend_down or (not all_inflow and long_flow < 0):
+            buy_tag = "▼ 약화"
+        else:
+            buy_tag = ""
 
         scored.append({
             "stock_code": code,
@@ -241,23 +323,36 @@ def build_cross_window_report(
             "both_types": both_types,
             "trend_up": trend_up,
             "trend_down": trend_down,
+            "acceleration": acceleration,
+            "flow_pct": flow_pct_val,
+            "conv_pct": conv_pct_val,
+            "breadth": breadth_val,
+            "depth": depth_val,
+            "active_wc_sum": active_wc_sum,
+            "passive_wc_sum": passive_wc_sum,
+            "total_wc_sum": total_wc_sum,
             "passive_count": passive_count,
             "active_count": active_count,
-            "new_passive": new_passive,
-            "new_active": new_active,
-            "breadth": breadth_val,
-            "top_etf_names": top_etf_names,
+            "new_passive_etfs": new_passive_etfs,
+            "new_active_etfs": new_active_etfs,
             "sectors": stock_sectors,
+            "buy_tag": buy_tag,
         })
 
     scored.sort(key=lambda x: x["cross_score"], reverse=True)
 
-    # ═══ 분석에 필요한 집계 ═══
+    # ═══ 집계 ═══
     sector_flow: dict[str, float] = {}
     for etf_code, net in etf_flow_map.items():
         sector = etf_sector_map.get(etf_code, "")
         if sector:
             sector_flow[sector] = sector_flow.get(sector, 0) + net
+
+    short_sector: dict[str, float] = {}
+    for etf_code, net in short_etf_flow_map.items():
+        sec = etf_sector_map.get(etf_code, "")
+        if sec:
+            short_sector[sec] = short_sector.get(sec, 0) + net
 
     sorted_sectors = sorted(sector_flow.items(), key=lambda x: x[1], reverse=True)
     inflow_sectors = [(s, v) for s, v in sorted_sectors if v > 0]
@@ -267,254 +362,129 @@ def build_cross_window_report(
     market_flow_total = sum(v for s, v in sector_flow.items() if s in market_sectors)
     theme_flow_total = sum(v for s, v in sector_flow.items() if s not in market_sectors)
 
-    passive_total = sum(
-        net for ec, net in etf_flow_map.items() if ec in passive_etf_codes
-    )
-    active_total = sum(
-        net for ec, net in etf_flow_map.items() if ec in active_etf_codes
-    )
+    passive_total = sum(net for ec, net in etf_flow_map.items() if ec in passive_etf_codes)
+    active_total = sum(net for ec, net in etf_flow_map.items() if ec in active_etf_codes)
 
     top_scored = scored[:top]
 
-    # 3d vs 10d 섹터 로테이션
-    short_w = min(windows)
-    short_start = base_date - timedelta(days=short_w)
-    short_flows = conn.execute("""
-        SELECT etf_code, SUM(net_units * nav) AS net_amount
-        FROM etf_flow WHERE date > ? AND date <= ?
-        GROUP BY etf_code
-    """, [short_start, base_date]).fetchall()
-    short_sector: dict[str, float] = {}
-    for ec, net in short_flows:
-        sec = etf_sector_map.get(ec, "")
-        if sec:
-            short_sector[sec] = short_sector.get(sec, 0) + net
-
+    # 단기 유출 전환 섹터
     turning_out = [
         s for s in short_sector
         if short_sector.get(s, 0) < 0 and sector_flow.get(s, 0) > 0
+        and s not in market_sectors
     ]
 
-    # 상위 종목 공통 섹터 분석
-    top_sector_count: dict[str, int] = {}
-    for s in top_scored:
-        for sec in s["sectors"]:
-            top_sector_count[sec] = top_sector_count.get(sec, 0) + 1
-    # 섹터 없는 종목의 ETF tier로 스타일 추론
-    top_style_count: dict[str, int] = {}
-    for s in top_scored:
-        for ec, _ in etf_holdings_map.get(s["stock_code"], []):
-            tier = etf_tier_map.get(ec, "")
-            sec = etf_sector_map.get(ec, "")
-            if tier == "strategy":
-                top_style_count[sec] = top_style_count.get(sec, 0) + 1
-
-    # ═══ 포맷팅: 5단 구성 ═══
+    # ═══ 포맷팅 ═══
     date_str = base_date.strftime("%m/%d")
     lines: list[str] = []
 
-    # ── ① 오늘의 시장 성격 ──
-    lines.append(f"📊 <b>ETF 자금흐름 브리핑</b>  {date_str}")
+    # ── ① 헤더 + 시장 국면 ──
+    lines.append(f"📊 <b>ETF 브리핑</b>  {date_str}")
     lines.append("")
 
-    # 시장 국면 판단
+    # 시장 국면: 비율 기반 판단
+    total_flow = abs(market_flow_total) + abs(theme_flow_total)
+    if total_flow > 0:
+        market_ratio = market_flow_total / total_flow   # -1 ~ +1
+        theme_ratio = theme_flow_total / total_flow
+    else:
+        market_ratio = theme_ratio = 0.0
+
     if market_flow_total > 0 and theme_flow_total > 0:
-        regime = "시장·테마 동반 유입, 위험선호(risk-on) 국면"
-    elif theme_flow_total > 0 > market_flow_total:
-        regime = "테마 ETF로 자금 쏠림, 업종 순환 장세"
-    elif market_flow_total > 0 > theme_flow_total:
-        regime = "지수 ETF 중심 유입, 방어적 베타 추종"
-    else:
-        regime = "시장·테마 동반 유출, 위험회피(risk-off) 국면"
-
-    # 주도 스타일 판단
-    top_inflow_names = [s for s, _ in inflow_sectors[:2]]
-    pa_desc = ""
-    if passive_total > 0 and active_total > 0:
-        pa_desc = "패시브·액티브 동반 유입"
-    elif active_total > 0 > passive_total:
-        pa_desc = "액티브만 유입 (선별적 장세)"
-    elif passive_total > 0 > active_total:
-        pa_desc = "패시브 중심 유입 (펀드매니저 신중)"
-    else:
-        pa_desc = "양쪽 모두 유출"
-
-    lines.append(f"{regime}")
-    if top_inflow_names:
-        lines.append(
-            f"자금 집중: {', '.join(top_inflow_names)} | {pa_desc}"
-        )
-    lines.append(
-        f"패시브 {passive_total / 1e8:+,.0f}억 · 액티브 {active_total / 1e8:+,.0f}억"
-    )
-
-    # ── ② 이번 주 주도 테마 ──
-    lines.append("")
-    lines.append("🎯 <b>주도 테마</b>")
-
-    # 유입 상위 섹터 3개에서 대표 종목 + 대표 ETF 매칭
-    theme_count = 0
-    used_sectors: set[str] = set()
-    for sec_name, sec_flow_val in inflow_sectors:
-        if theme_count >= 3:
-            break
-        if sec_name in market_sectors:
-            continue  # 시장 전체 섹터는 테마가 아님
-        used_sectors.add(sec_name)
-
-        # 대표 종목: 해당 섹터 ETF에 편입된 상위 랭킹 종목
-        rep_stock = ""
-        for s in top_scored:
-            if sec_name in s["sectors"]:
-                rep_stock = s["stock_name"]
-                break
-        if not rep_stock:
-            # 전체 scored에서 탐색
-            for s in scored[:30]:
-                if sec_name in s["sectors"]:
-                    rep_stock = s["stock_name"]
-                    break
-
-        # 대표 ETF: 해당 섹터 ETF 중 유입 최대
-        rep_etf = ""
-        sec_etfs = [
-            (ec, etf_flow_map.get(ec, 0))
-            for ec in etf_sector_map
-            if etf_sector_map[ec] == sec_name
-        ]
-        sec_etfs.sort(key=lambda x: x[1], reverse=True)
-        if sec_etfs:
-            rep_etf = etf_name_map.get(sec_etfs[0][0], "")
-
-        # 이유 생성
-        flow_billions = sec_flow_val / 1e8
-        reason = f"{flow_billions:+,.0f}억 유입"
-        # 단기 가속 여부
-        short_val = short_sector.get(sec_name, 0)
-        if short_val > 0 and sec_flow_val > 0:
-            short_ratio = short_val / sec_flow_val if sec_flow_val else 0
-            if short_ratio > 0.5:
-                reason += ", 단기 가속 중"
-
-        stock_part = rep_stock if rep_stock else "—"
-        etf_part = rep_etf if rep_etf else "—"
-        lines.append(f"• <b>{sec_name}</b>: {stock_part} / {etf_part} — {reason}")
-        theme_count += 1
-
-    # 테마가 3개 미만이면 전략 스타일에서 보충
-    if theme_count < 3 and top_style_count:
-        for style, cnt in sorted(top_style_count.items(), key=lambda x: -x[1]):
-            if theme_count >= 3 or style in used_sectors:
-                continue
-            style_flow = sector_flow.get(style, 0)
-            if style_flow <= 0:
-                continue
-            rep_stock = ""
-            for s in top_scored:
-                holdings = etf_holdings_map.get(s["stock_code"], [])
-                for ec, _ in holdings:
-                    if etf_sector_map.get(ec) == style:
-                        rep_stock = s["stock_name"]
-                        break
-                if rep_stock:
-                    break
-            rep_etf = ""
-            style_etfs = [
-                (ec, etf_flow_map.get(ec, 0))
-                for ec in etf_sector_map if etf_sector_map[ec] == style
-            ]
-            style_etfs.sort(key=lambda x: x[1], reverse=True)
-            if style_etfs:
-                rep_etf = etf_name_map.get(style_etfs[0][0], "")
-            stock_part = rep_stock if rep_stock else "—"
-            etf_part = rep_etf if rep_etf else "—"
-            lines.append(
-                f"• <b>{style}</b>: {stock_part} / {etf_part} "
-                f"— {style_flow / 1e8:+,.0f}억, 상위권 {cnt}종목 편입"
-            )
-            theme_count += 1
-
-    # ── ③ Top 10 랭킹 ──
-    lines.append("")
-    lines.append("🏆 <b>Top 10</b>")
-
-    for i, s in enumerate(top_scored, 1):
-        flow_val = s["window_flows"].get(longest_w, 0) / 1e8
-
-        # 추세 신호
-        if s["all_inflow"] and s["trend_up"]:
-            signal = "▲ 강화"
-        elif s["all_inflow"]:
-            signal = "▲ 유입"
-        elif s["trend_down"]:
-            signal = "▼ 약화"
+        if theme_ratio > 0.6:
+            regime = "테마 주도 유입 — 업종 순환"
+        elif market_ratio > 0.6:
+            regime = "지수 중심 유입 — 방어적 베타"
         else:
-            signal = "─"
+            regime = "시장·테마 동반 유입 — risk-on"
+    elif theme_flow_total > 0 > market_flow_total:
+        regime = "테마 ETF 집중 유입 — 업종 순환"
+    elif market_flow_total > 0 > theme_flow_total:
+        regime = "지수 ETF 집중 유입 — 방어적 베타"
+    else:
+        regime = "시장·테마 동반 유출 — risk-off"
 
-        # ETF 편입 (신규 포함)
-        p_new = f"(+{s['new_passive']})" if s["new_passive"] else ""
-        a_new = f"(+{s['new_active']})" if s["new_active"] else ""
-        etf_str = f"P:{s['passive_count']}{p_new} A:{s['active_count']}{a_new}"
+    lines.append(f"▪ {regime}")
+    lines.append(f"▪ 패시브 {passive_total / 1e8:+,.0f}억  액티브 {active_total / 1e8:+,.0f}억")
 
+    # ── ② 섹터 자금 흐름 (인라인) ──
+    theme_sectors = [(s, v) for s, v in sorted_sectors if s not in market_sectors]
+    if theme_sectors:
+        lines.append("")
+        lines.append("☑️ <b>섹터</b>")
+        parts = []
+        for sec_name, sec_val in theme_sectors[:6]:
+            sign = "+" if sec_val >= 0 else ""
+            short_val = short_sector.get(sec_name, 0)
+            accel_mark = ""
+            if sec_val > 0 and short_val > 0 and (short_val / sec_val) > 0.5:
+                accel_mark = "↑"
+            elif sec_name in turning_out:
+                accel_mark = "⚠"
+            parts.append(f"{sec_name} {sign}{sec_val / 1e8:.0f}억{accel_mark}")
+        lines.append("  " + "  |  ".join(parts[:3]))
+        if len(parts) > 3:
+            lines.append("  " + "  |  ".join(parts[3:6]))
+
+    # ── ③ Top N: 태그 + 10d 누적 + 가속도 ──
+    main_scored = [s for s in top_scored if s["buy_tag"] != "△ 수급 유입"]
+    passive_scored = [s for s in top_scored if s["buy_tag"] == "△ 수급 유입"]
+
+    lines.append("")
+    lines.append(f"🏆 <b>Top {top}</b>")
+
+    for i, s in enumerate(main_scored[:top], 1):
+        long_flow_val = s["window_flows"].get(longest_w, 0) / 1e8
+        tag = f"  {s['buy_tag']}" if s["buy_tag"] else ""
+        accel_str = f"  ×{s['acceleration']:.1f}↑" if s["acceleration"] >= 1.5 and s["all_inflow"] else ""
+        sign = "+" if long_flow_val >= 0 else ""
         lines.append(
-            f"{i:>2}. <b>{s['stock_name']}</b> | "
-            f"{s['cross_score']:.0f}점 | "
-            f"{flow_val:+,.0f}억 | "
-            f"{signal} | {etf_str}"
+            f"{i:>2}. <b>{s['stock_name']}</b>{tag}  {sign}{long_flow_val:.0f}억{accel_str}"
         )
 
-    # 공통 특징 한 줄
-    all_inflow_count = sum(1 for s in top_scored if s["all_inflow"])
-    both_count = sum(1 for s in top_scored if s["both_types"])
-    dominant_sectors = sorted(top_sector_count.items(), key=lambda x: -x[1])
-    dominant_styles = sorted(top_style_count.items(), key=lambda x: -x[1])
-
-    common_parts = []
-    if dominant_sectors:
-        common_parts.append(dominant_sectors[0][0])
-    if dominant_styles:
-        common_parts.append(dominant_styles[0][0])
-    common_theme = "+".join(common_parts) if common_parts else "다양한 업종"
-
-    lines.append(
-        f"→ 상위권 {common_theme} 중심, "
-        f"전구간유입 {all_inflow_count}/{top} · P+A {both_count}/{top}"
-    )
-
-    # ── ④ 주목할 시그널 ──
-    trend_up_stocks = [s for s in top_scored if s["trend_up"]]
-    if trend_up_stocks or turning_out:
+    # ── ④ 수급 참고 (패시브 리밸런싱) ──
+    if passive_scored:
         lines.append("")
-        lines.append("⚡ <b>주목 시그널</b>")
+        lines.append("💡 <b>수급 참고</b>  패시브 리밸런싱 추정")
+        names_flows = []
+        for s in passive_scored[:4]:
+            lf = s["window_flows"].get(longest_w, 0) / 1e8
+            sign = "+" if lf >= 0 else ""
+            names_flows.append(f"{s['stock_name']} {sign}{lf:.0f}억")
+        lines.append("  " + "  ·  ".join(names_flows))
 
-        if trend_up_stocks:
-            names = [s["stock_name"] for s in trend_up_stocks[:3]]
-            lines.append(
-                f"추세 강화: {', '.join(names)} "
-                f"— 단기→장기 점수 상승, 자금 유입 가속 구간"
-            )
+    # ── ⑤ 시그널 ──
+    signal_lines = []
 
-        if turning_out:
-            lines.append(
-                f"⚠️ 단기 유출 전환: {', '.join(turning_out[:3])} "
-                f"— {longest_w}d 유입이었으나 {short_w}d 유출, "
-                f"차익실현 또는 로테이션 가능성"
-            )
+    active_new_stocks = [s for s in top_scored if s["new_active_etfs"]]
+    if active_new_stocks:
+        names = [s["stock_name"] for s in active_new_stocks[:3]]
+        signal_lines.append(f"액티브 신규 편입: {', '.join(names)}")
 
-    # ── ⑤ 한줄 액션 포인트 ──
-    lines.append("")
+    accel_stocks = [s for s in top_scored if s["acceleration"] >= 1.5 and s["all_inflow"]]
+    if accel_stocks:
+        names = [s["stock_name"] for s in accel_stocks[:3]]
+        signal_lines.append(f"매수 가속: {', '.join(names)}")
 
-    # 유지 추천: 유입 상위 2개 테마
+    if turning_out:
+        signal_lines.append(
+            f"단기 유출 전환: {', '.join(turning_out[:3])}  ({longest_w}d 유입→{short_w}d 유출)"
+        )
+
+    if signal_lines:
+        lines.append("")
+        lines.append("⚡ <b>시그널</b>")
+        for sl in signal_lines:
+            lines.append(f"  ▪ {sl}")
+
+    # ── ⑥ 액션 포인트 ──
     hold_themes = [s for s, _ in inflow_sectors[:2] if s not in market_sectors]
-    # 축소 고려: 유출 하위 2개
     reduce_themes = [s for s, _ in outflow_sectors[-2:] if s not in market_sectors]
-
-    hold_str = "·".join(hold_themes) if hold_themes else "상위 유입 업종"
+    hold_str = "·".join(hold_themes) if hold_themes else "유입 업종"
     reduce_str = "·".join(reduce_themes) if reduce_themes else "유출 업종"
 
-    lines.append(
-        f"🎯 {hold_str} 비중 유지, {reduce_str} 단기 비중 축소 고려"
-    )
+    lines.append("")
+    lines.append(f"▪ 비중 유지: {hold_str}  /  축소 검토: {reduce_str}")
 
     return "\n".join(lines)
 
